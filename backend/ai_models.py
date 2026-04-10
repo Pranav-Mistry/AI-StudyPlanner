@@ -5,10 +5,17 @@ import math
 from collections import Counter
 from textwrap import dedent
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 import torch
 from dotenv import load_dotenv
+from google.api_core import exceptions as google_exceptions
 from transformers import pipeline
+try:
+    from groq import Groq as GroqClient
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
 
 load_dotenv()
 
@@ -16,148 +23,180 @@ load_dotenv()
 class AIModels:
     def __init__(self):
         self.device = 0 if torch.cuda.is_available() else -1
-        print(f"🔧 Using device: {'GPU' if self.device == 0 else 'CPU'}")
+        print(f"[INFO] Using device: {'GPU' if self.device == 0 else 'CPU'}")
 
         self.use_gemini = False
+        self.use_groq = False
+        self.groq_client = None
         self.ready = False
-
-        # Ensure attributes always exist even if heavy models fail to load
         self.summarizer = None
         self.qa_model = None
         self.explainer = None
+        self.last_ai_error = None
 
         self._init_gemini()
-        self._init_local_models()
+        self._init_groq()
+        if self.use_gemini or self.use_groq:
+            self.ready = True
+            providers = []
+            if self.use_gemini:
+                providers.append("Gemini")
+            if self.use_groq:
+                providers.append("Groq")
+            print(f"[INFO] AI providers active: {' + '.join(providers)}. Local transformer fallbacks will load only when needed.")
+        else:
+            self._init_local_models()
 
     def _init_gemini(self):
-        """Configure Google Gemini if an API key is provided."""
+        """Configure Google Gemini (new google.genai SDK) if an API key is provided.
+        
+        NOTE: We do NOT make a live test call here. Making a generate_content()
+        call during init causes 503 failures on the Flask stat-reloader restart,
+        which wrongly marks Gemini as unavailable for the whole session.
+        The real error handling is in _call_gemini().
+        """
         try:
             api_key = os.getenv('GEMINI_API_KEY')
             if not api_key:
-                print("⚠️ GEMINI_API_KEY not found, defaulting to local transformer models.")
+                print("[WARNING] GEMINI_API_KEY not found, defaulting to local transformer models.")
                 return
 
-            genai.configure(api_key=api_key)
-            
-            # First, try to list available models
-            try:
-                models = genai.list_models()
-                available_models = []
-                preferred_models = [
-                    'gemini-2.5-flash',           # Fast and efficient
-                    'gemini-flash-latest',        # Latest flash version
-                    'gemini-2.5-pro',             # More capable
-                    'gemini-pro-latest',          # Latest pro version
-                ]
-                
-                for model in models:
-                    if 'generateContent' in model.supported_generation_methods:
-                        model_name = model.name.replace('models/', '')
-                        available_models.append(model_name)
-                
-                if available_models:
-                    # Try preferred models first
-                    for preferred in preferred_models:
-                        if preferred in available_models:
-                            model_name = preferred
-                            self.gemini_model = genai.GenerativeModel(model_name)
-                            print(f"✅ Google Gemini API configured successfully (using {model_name}).")
-                            self.use_gemini = True
-                            return
-                    
-                    # If preferred not found, use first available
-                    model_name = available_models[0]
-                    self.gemini_model = genai.GenerativeModel(model_name)
-                    print(f"✅ Google Gemini API configured successfully (using {model_name}).")
-                    self.use_gemini = True
-                    return
-                else:
-                    print("⚠️ No models with generateContent found, trying common names...")
-            except Exception as list_error:
-                # If listing fails (e.g., quota), try common names directly
-                print(f"⚠️ Could not list models: {str(list_error)[:100]}...")
-                print("   Trying common model names directly...")
-            
-            # Fallback: Try newer model names
-            model_names = [
-                'gemini-2.5-flash',      # Fast and efficient
-                'gemini-flash-latest',   # Latest flash
-                'gemini-2.5-pro',        # More capable
-                'gemini-pro-latest',     # Latest pro
+            # Validate key looks reasonable (non-empty, starts with expected prefix)
+            if len(api_key) < 10:
+                print("[WARNING] GEMINI_API_KEY looks invalid (too short).")
+                return
+
+            self.gemini_client = genai.Client(api_key=api_key)
+
+            # Use the first preferred model — no test call needed.
+            # Only models that work with google.genai SDK (v1beta). The 1.5-* models
+            # return 404 in v1beta. gemini-2.0-flash is the most stable free-tier option.
+            preferred_models = [
+                'gemini-2.0-flash',
+                'gemini-2.5-flash',
+                'gemini-2.0-flash-lite',
             ]
-            
-            self.gemini_model = None
-            for model_name in model_names:
-                try:
-                    self.gemini_model = genai.GenerativeModel(model_name)
-                    # Test if it works with a simple request
-                    test_response = self.gemini_model.generate_content("test")
-                    if test_response and hasattr(test_response, 'text'):
-                        print(f"✅ Google Gemini API configured successfully (using {model_name}).")
-                        self.use_gemini = True
-                        return
-                except Exception as e:
-                    continue
-            
-            # If all models failed
-            print("⚠️ All Gemini models failed to initialize, using local models.")
-            print("💡 Make sure Gemini API is enabled in Google Cloud Console:")
-            print("   https://console.cloud.google.com/apis/library/generativelanguage.googleapis.com")
-            self.use_gemini = False
+            self.gemini_model_name = preferred_models[0]
+            self.use_gemini = True
+            print(f"[SUCCESS] Google Gemini API configured successfully (using {self.gemini_model_name}).")
+
         except Exception as e:
-            print(f"⚠️ Failed to initialize Gemini: {e}")
+            print(f"[ERROR] Failed to initialize Gemini: {e}")
             self.use_gemini = False
+
+    def _init_groq(self):
+        """Initialize Groq as a secondary AI provider (free tier, llama models).
+        Groq is used automatically when all Gemini models are quota-limited.
+        Get a free API key at: https://console.groq.com
+        """
+        if not GROQ_AVAILABLE:
+            return
+        api_key = os.getenv('GROQ_API_KEY')
+        if not api_key:
+            return  # Optional — silently skip if not configured
+        try:
+            self.groq_client = GroqClient(api_key=api_key)
+            self.use_groq = True
+            print("[SUCCESS] Groq API configured successfully (using llama-3.1-8b-instant as fallback).")
+        except Exception as e:
+            print(f"[WARNING] Groq initialization failed: {e}")
+            self.use_groq = False
+
+    def _call_groq(self, prompt, max_tokens=1024):
+        """Call Groq API using llama-3.1-8b-instant.
+        Free tier: 14,400 requests/day, 6,000 tokens/min — much more generous than Gemini.
+        """
+        if not self.use_groq or not self.groq_client:
+            return None
+        try:
+            completion = self.groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.6,
+            )
+            text = completion.choices[0].message.content
+            if text and text.strip():
+                print(f"[Groq] Successfully generated response ({len(text)} chars)")
+                return text.strip()
+            return None
+        except Exception as e:
+            err = str(e)
+            if 'rate_limit' in err.lower() or '429' in err:
+                print(f"[Groq] Rate limit hit: {err[:80]}")
+            else:
+                print(f"[Groq] Error: {err[:120]}")
+            return None
+
+    def _call_ai(self, prompt, max_output_tokens=1024):
+        """Try Gemini first, then Groq as fallback. Returns the first successful response."""
+        # Try Gemini
+        if self.use_gemini:
+            result = self._call_gemini(prompt, max_output_tokens=max_output_tokens)
+            if result:
+                return result
+        # Try Groq if Gemini failed
+        if self.use_groq:
+            print("[AI] Gemini unavailable, trying Groq fallback...")
+            result = self._call_groq(prompt, max_tokens=max_output_tokens)
+            if result:
+                return result
+        return None
 
     def _init_local_models(self):
-        """Load local transformer pipelines as fallbacks."""
-        errors = []
+
+        """Load local transformer pipelines as fallbacks.
+        Each model is loaded independently so one failure doesn't block others.
+        """
+        print("[INFO] Loading local transformer models (fallback only)...")
+        any_loaded = False
+
+        # Summarizer
         try:
-            print("📥 Loading local transformer models...")
-            if not self.summarizer:
-                try:
-                    self.summarizer = pipeline(
-                        "summarization",
-                        model="facebook/bart-large-cnn",
-                        device=self.device
-                    )
-                    print("✅ Summarization model loaded.")
-                except Exception as summarizer_error:
-                    errors.append(f"summarizer: {summarizer_error}")
-                    print(f"⚠️ Summarizer load failed: {summarizer_error}")
-
-            if not self.qa_model:
-                try:
-                    self.qa_model = pipeline(
-                        "question-answering",
-                        model="deepset/roberta-base-squad2",
-                        device=self.device
-                    )
-                    print("✅ Q&A model loaded.")
-                except Exception as qa_error:
-                    errors.append(f"qa: {qa_error}")
-                    print(f"⚠️ Q&A model load failed: {qa_error}")
-
-            if not self.explainer:
-                try:
-                    self.explainer = pipeline(
-                        "text2text-generation",
-                        model="google/flan-t5-base",
-                        device=self.device
-                    )
-                    print("✅ Local explanation model loaded.")
-                except Exception as explain_error:
-                    errors.append(f"explainer: {explain_error}")
-                    print(f"⚠️ Explainer load failed: {explain_error}")
-
-            self.ready = any([self.summarizer, self.qa_model, self.explainer])
-            if self.ready:
-                print("🎉 AI models ready (with fallbacks where needed).")
-            else:
-                print("⚠️ Could not load any heavy models, using lightweight fallbacks only.")
+            self.summarizer = pipeline(
+                "summarization",
+                model="facebook/bart-large-cnn",
+                device=self.device
+            )
+            print("[SUCCESS] Summarization model loaded.")
+            any_loaded = True
         except Exception as e:
-            errors.append(str(e))
-            print(f"⚠️ Error loading local models: {e}")
-            self.ready = False
+            print(f"[WARNING] Summarization model failed to load: {e}")
+            self.summarizer = None
+
+        # Q&A model
+        try:
+            self.qa_model = pipeline(
+                "question-answering",
+                model="deepset/roberta-base-squad2",
+                device=self.device
+            )
+            print("[SUCCESS] Q&A model loaded.")
+            any_loaded = True
+        except Exception as e:
+            print(f"[WARNING] Q&A model failed to load: {e}")
+            self.qa_model = None
+
+        # Text generation / explainer
+        try:
+            self.explainer = pipeline(
+                "text2text-generation",
+                model="google/flan-t5-base",
+                device=self.device
+            )
+            print("[SUCCESS] Local explanation model loaded.")
+            any_loaded = True
+        except Exception as e:
+            print(f"[WARNING] Explanation model failed to load: {e}")
+            self.explainer = None
+
+        if any_loaded:
+            self.ready = True
+            print("[SUCCESS] Local AI models ready (partial or full).")
+        else:
+            print("[WARNING] No local models could be loaded. Only Gemini will be used.")
+            # Still mark ready=True so the app doesn't block — Gemini handles most requests
+            self.ready = True
 
     def is_ready(self):
         return self.ready
@@ -169,33 +208,70 @@ class AIModels:
             if len(text) < 50:
                 return "Please provide at least 50 characters of content to summarize."
 
-            summary_text = None
+            original_length = len(text)
 
-            if self.use_gemini:
+            # ── 1. Try AI (Gemini first, then Groq) ──────────────────────────
+            if self.use_gemini or self.use_groq:
+                print(f"[Summarize] Calling AI for {original_length}-char text")
                 prompt = dedent(f"""
-                You are an academic summarizer. Summarize the following content in 2-3 sentences
-                and provide up to five bullet points with key insights. Respond with valid JSON:
-                {{
-                  "summary": "two to three sentences paraphrased in your own words",
-                  "key_points": ["concise takeaway 1", "concise takeaway 2"]
-                }}
+                You are an expert academic summarizer. Read the text below and write a concise summary.
 
-                Avoid copying sentences verbatim; focus on main ideas only.
+                Rules:
+                - Write 2-4 sentences maximum
+                - Use your OWN words — do NOT copy sentences from the original
+                - Focus on the main idea and most important points only
+                - Omit examples, minor details, and repetition
+                - After the summary, list 3 key bullet points
 
-                Content:
-                \"\"\"{text[:4000]}\"\"\"
+                Format your response EXACTLY like this:
+                SUMMARY:
+                [Your 2-4 sentence summary in your own words]
+
+                KEY POINTS:
+                • [Point 1]
+                • [Point 2]
+                • [Point 3]
+
+                Text to summarize:
+                \"\"\"
+                {text[:4000]}
+                \"\"\"
                 """)
-                response = self._call_gemini(prompt)
-                summary_text = self._summary_from_response(response)
+                response = self._call_ai(prompt, max_output_tokens=1024)
 
-            if not summary_text:
-                summary_text = self._local_summarize(text, max_length, min_length)
+                if response and len(response.strip()) > 50:
+                    print(f"[Summarize] AI success ({len(response)} chars)")
+                    r = response.strip()
 
-            return self._format_summary_output(summary_text, text)
+                    # Case 1: Full structured response with both sections
+                    if "SUMMARY:" in r and "KEY POINTS:" in r:
+                        parts = r.split("KEY POINTS:")
+                        summary_part = parts[0].replace("SUMMARY:", "").strip()
+                        key_points_part = parts[1].strip()
+                        return f"{summary_part}\n\nKey Points:\n{key_points_part}"
+
+                    # Case 2: Only SUMMARY section (no KEY POINTS — response was cut short)
+                    if "SUMMARY:" in r:
+                        summary_part = r.replace("SUMMARY:", "").strip()
+                        return summary_part
+
+                    # Case 3: Free-form response (AI ignored format) — use as-is
+                    return r
+                else:
+                    print("[Summarize] All AI providers returned empty/short response, using extractive fallback")
+
+            # ── 2. Extractive fallback (when all AI providers are unavailable) ──
+            print("[Summarize] Using extractive fallback")
+            extractive = self._extractive_summarize(text, max_chars=400)
+
+            # Add a clear notice so the user knows this is a basic fallback
+            notice = "⚠️ AI summarizer is temporarily unavailable (API quota). Showing key sentences from your text:\n\n"
+            return notice + extractive
 
         except Exception as e:
-            print(f"Error in summarization: {e}")
+            print(f"[Summarize] Error: {e}")
             return "Error generating summary. Please try again later."
+
 
     def generate_study_plan(self, syllabus_text, days_available=30):
         """Generate a structured study plan from syllabus."""
@@ -206,7 +282,7 @@ class AIModels:
                     'error': 'Please provide a more detailed syllabus to generate a plan.'
                 }
 
-            if self.use_gemini:
+            if self.use_gemini or self.use_groq:
                 prompt = dedent(f"""
                 You are an expert academic planner. Create an actionable study plan based on the syllabus
                 below. Spread topics across {days_available} days. Respond with valid JSON:
@@ -228,7 +304,7 @@ class AIModels:
                 Syllabus:
                 \"\"\"{cleaned_text[:4000]}\"\"\"
                 """)
-                response = self._call_gemini(prompt, max_output_tokens=2048)
+                response = self._call_ai(prompt, max_output_tokens=2048)
                 plan = self._plan_from_response(response, days_available)
                 if plan:
                     return plan
@@ -251,76 +327,58 @@ class AIModels:
         print(f"[Explain] Processing concept: '{concept}'")
 
         try:
-            explanation = None
-            
-            # Try Gemini first if available
-            if self.use_gemini:
-                print(f"[Explain] Attempting Gemini API for '{concept}'")
+            # ── 1. Try AI (Gemini → Groq fallback) ──────────────────────────
+            if self.use_gemini or self.use_groq:
+                print(f"[Explain] Attempting AI for '{concept}'")
                 prompt = dedent(f"""
-                You are a friendly study assistant. Explain the concept "{concept}" to a student in detail.
-                
-                Provide a comprehensive explanation that includes:
-                1. A clear, concise definition (2-3 sentences)
-                2. Key points or components (3-5 bullet points)
-                3. A real-world example or application
-                4. A study tip for remembering this concept
-                
-                Write naturally and conversationally, as if explaining to a friend. Make sure to complete your explanation fully.
+                You are a friendly study assistant. Explain the concept "{concept}" to a student.
+
+                Structure your answer exactly like this:
+
+                **Definition**
+                Write 2-3 clear sentences explaining what {concept} is.
+
+                **Key Points**
+                - Point 1
+                - Point 2
+                - Point 3
+                - Point 4
+
+                **Real-World Example**
+                Give one concrete, relatable example.
+
+                **Study Tip**
+                Give one practical tip for remembering this concept.
+
+                Be specific about {concept}. Do not give a generic answer.
                 """)
-                explanation = self._call_gemini(prompt, max_output_tokens=4096)
-                
-                if explanation:
-                    print(f"[Explain] Got Gemini response ({len(explanation)} chars)")
-                else:
-                    print("[Explain] Gemini returned None, trying local model")
+                explanation = self._call_ai(prompt, max_output_tokens=2048)
 
-            # Fallback to local model if Gemini didn't work
-            if not explanation:
-                print(f"[Explain] Using local model for '{concept}'")
-                explanation = self._generate_local_explanation(concept)
-                if explanation:
-                    print(f"[Explain] Got local model response ({len(explanation)} chars)")
-
-            # Use the explanation directly if it's good, especially from Gemini
-            if explanation and len(explanation.strip()) > 100:
-                # Clean up obvious repetition issues
-                cleaned = self._sanitize_explanation_text(explanation)
-                
-                # If it's from Gemini and looks good, use it directly
-                if self.use_gemini and cleaned and len(cleaned.strip()) > 100:
-                    # Check for severe repetition only
-                    if not self._has_high_repetition(cleaned):
-                        print(f"[Explain] Using Gemini response directly ({len(cleaned)} chars)")
-                        return cleaned.strip()
-                    else:
-                        print(f"[Explain] Gemini response has repetition, cleaning further")
-                        # One more aggressive clean
-                        cleaned = self._sanitize_explanation_text(cleaned)
-                        if cleaned and len(cleaned.strip()) > 80:
-                            return cleaned.strip()
-                
-                # If we still have a good explanation after cleaning, use it
-                if cleaned and len(cleaned.strip()) > 80:
-                    print(f"[Explain] Using cleaned explanation ({len(cleaned)} chars)")
-                    return cleaned.strip()
-            
-            # If explanation is too short or empty, try formatting or use template
-            if explanation and len(explanation.strip()) > 50:
-                formatted = self._format_explanation_output(concept, explanation)
-                # Only use template if formatting also failed
-                if "refers to a set of ideas" in formatted:
-                    print(f"[Explain] Formatting returned template, using original explanation")
+                if explanation and len(explanation.strip()) > 80:
+                    print(f"[Explain] AI success ({len(explanation)} chars) — returning directly")
                     return explanation.strip()
-                return formatted
-            else:
-                print(f"[Explain] Explanation too short or empty ({len(explanation.strip()) if explanation else 0} chars), using template")
-                return self._format_explanation_output(concept, None)
-                
+                elif self.last_ai_error:
+                    print(f"[Explain] AI failed ({self.last_ai_error.get('type')}): {self.last_ai_error.get('message')}")
+                    print("[Explain] Falling back to local model...")
+                else:
+                    print("[Explain] AI returned empty response, trying local model")
+
+            # ── 2. Try local transformer model ─────────────────────────────
+            print(f"[Explain] Using local model for '{concept}'")
+            local_explanation = self._generate_local_explanation(concept)
+            if local_explanation and len(local_explanation.strip()) > 80:
+                print(f"[Explain] Local model success ({len(local_explanation)} chars)")
+                return local_explanation.strip()
+
+            # ── 3. Last resort: generic template ───────────────────────────
+            print(f"[Explain] All AI methods failed — using generic template")
+            return self._generic_concept_template(concept)
+
         except Exception as e:
             print(f"[Explain] Error in explain_concept: {e}")
             import traceback
             traceback.print_exc()
-            return self._format_explanation_output(concept, None)
+            return self._generic_concept_template(concept)
 
     def answer_question(self, question, context):
         """Answer questions based on provided context."""
@@ -328,7 +386,7 @@ class AIModels:
             question = question.strip()
             context = context.strip()
 
-            if self.use_gemini:
+            if self.use_gemini or self.use_groq:
                 prompt = dedent(f"""
                 You are an exam-preparation assistant. Using only the context below, answer the question.
                 If the context does not contain the answer, say so explicitly.
@@ -338,20 +396,26 @@ class AIModels:
 
                 Question: {question}
                 """)
-                response = self._call_gemini(prompt)
+                response = self._call_ai(prompt)
                 if response:
                     return {
                         'answer': response,
                         'confidence': 0.9
                     }
 
-            result = self.qa_model(
-                question=question,
-                context=context
-            )
+            if self.qa_model:
+                result = self.qa_model(
+                    question=question,
+                    context=context
+                )
+                return {
+                    'answer': result['answer'],
+                    'confidence': result['score']
+                }
+
             return {
-                'answer': result['answer'],
-                'confidence': result['score']
+                'answer': 'Could not answer locally because the Q&A model is not loaded.',
+                'confidence': 0.0
             }
 
         except Exception as e:
@@ -391,13 +455,160 @@ class AIModels:
             Content:
             \"\"\"{cleaned_text[:4000]}\"\"\"
             """)
-            response = self._call_gemini(prompt, max_output_tokens=4096)
+            response = self._call_ai(prompt, max_output_tokens=4096)
             quiz = self._parse_quiz_response(response)
             if quiz:
                 return quiz
 
         # Fallback to simple fact-based questions
         return self._fallback_quiz(cleaned_text, num_questions)
+
+    def generate_flashcards(self, text, num_cards=8):
+        """Generate flashcard Q&A pairs from text using AI.
+        Returns a list of {'question': ..., 'answer': ...} dicts.
+        """
+        cleaned = text.strip()
+        if not cleaned:
+            return []
+
+        if self.use_gemini or self.use_groq:
+            # Simpler prompt — shorter field names, explicit no-markdown instruction
+            prompt = dedent(f"""
+            Create exactly {num_cards} study flashcards from the text below.
+
+            Output ONLY a valid JSON array. No markdown, no code fences, no explanation — just raw JSON.
+
+            Format:
+            [{{"q":"Question here?","a":"Answer here."}},{{"q":"Next question?","a":"Next answer."}}]
+
+            Rules for questions:
+            - Ask about KEY FACTS, DEFINITIONS, CONCEPTS, PROCESSES from the text
+            - Use varied question types: What is...? How does...? Why is...? What causes...?
+            - Each question must be answerable directly from the text
+
+            Rules for answers:
+            - 1-3 sentences, accurate and concise
+            - Do NOT say "According to the text" — just state the fact
+
+            Text:
+            {cleaned[:3500]}
+
+            JSON:""")
+
+            response = self._call_ai(prompt, max_output_tokens=2048)
+            print(f"[Flashcards] Raw AI response (first 300 chars): {repr(response[:300]) if response else 'None'}")
+
+            if response:
+                parsed = self._extract_json_array(response)
+                if parsed and isinstance(parsed, list) and len(parsed) > 0:
+                    cards = []
+                    for item in parsed:
+                        if not isinstance(item, dict):
+                            continue
+                        # Accept both q/a (short) and question/answer (long) field names
+                        q = str(item.get('q') or item.get('question') or '').strip()
+                        a = str(item.get('a') or item.get('answer') or '').strip()
+                        if q and a and len(q) > 4 and len(a) > 4:
+                            cards.append({'question': q, 'answer': a})
+                    if cards:
+                        print(f"[Flashcards] Generated {len(cards)} cards via AI")
+                        return cards
+                print(f"[Flashcards] JSON parse failed or empty — response was: {repr(response[:200])}")
+
+        # Fallback: smarter sentence-based flashcards
+        print("[Flashcards] Using smart sentence fallback")
+        return self._fallback_flashcards(cleaned, num_cards)
+
+    def _extract_json_array(self, text):
+        """Robustly extract a JSON array from AI output that may have:
+        - markdown code fences (```json ... ```)
+        - leading/trailing prose
+        - escaped characters
+        """
+        if not text:
+            return None
+
+        # Step 1: strip markdown code fences like ```json ... ``` or ``` ... ```
+        text = re.sub(r'```(?:json)?\s*', '', text)
+        text = re.sub(r'```', '', text)
+        text = text.strip()
+
+        # Step 2: try parsing the whole cleaned text directly
+        try:
+            result = json.loads(text)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # Step 3: find the outermost [...] array in the text
+        start = text.find('[')
+        end   = text.rfind(']')
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                result = json.loads(candidate)
+                if isinstance(result, list):
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+        # Step 4: try lenient cleanup — remove trailing commas before ] or }
+        if start != -1 and end != -1:
+            candidate = text[start:end + 1]
+            candidate = re.sub(r',\s*([}\]])', r'\1', candidate)  # remove trailing commas
+            try:
+                result = json.loads(candidate)
+                if isinstance(result, list):
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    def _fallback_flashcards(self, text, num_cards=8):
+        """Smarter sentence-based fallback — creates definition/fact questions."""
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 40]
+
+        cards = []
+        used = set()
+
+        for sent in sentences:
+            if len(cards) >= num_cards:
+                break
+            if sent in used:
+                continue
+            used.add(sent)
+
+            words = sent.split()
+            if len(words) < 6:
+                continue
+
+            # Try to find a key term (capitalized word or first noun-like word)
+            key_term = None
+            for w in words[:8]:
+                clean_w = re.sub(r'[^a-zA-Z]', '', w)
+                if len(clean_w) > 3 and clean_w[0].isupper():
+                    key_term = clean_w
+                    break
+
+            if key_term:
+                # "What is <KeyTerm>?" pattern
+                question = f"What is {key_term}?"
+                answer = sent
+            else:
+                # "What does this statement describe?" pattern using first few words
+                stem = ' '.join(words[:4])
+                question = f"Complete or explain: \"{stem}...\"?"
+                answer = sent
+
+            cards.append({'question': question, 'answer': answer})
+
+        if not cards:
+            cards.append({'question': 'What is the main topic of this content?', 'answer': text[:300]})
+
+        return cards
 
     def extract_keywords(self, text, top_n=10):
         """Extract important keywords from text."""
@@ -415,6 +626,9 @@ class AIModels:
     # Helper methods -----------------------------------------------------
 
     def _generate_local_explanation(self, concept):
+        if not self.explainer:
+            return None
+
         prompt = dedent(f"""
         Explain "{concept}" to a college student. Provide:
         Definition:
@@ -440,38 +654,123 @@ class AIModels:
             return None
 
     def _call_gemini(self, prompt, temperature=0.65, max_output_tokens=4096):
-        if not self.use_gemini:
+        self.last_ai_error = None
+
+        if not self.use_gemini or not self.gemini_model_name:
             print("[Gemini] Not enabled, using fallback")
             return None
-        try:
-            response = self.gemini_model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": temperature,
-                    "top_p": 0.9,
-                    "max_output_tokens": max_output_tokens
+
+        # Model cascade: only models verified to work with the google.genai SDK (v1beta).
+        # gemini-1.5-* models return 404 in this API version — do NOT include them.
+        # gemini-2.0-flash-lite has higher free-tier RPD and is more available.
+        all_models = [
+            'gemini-2.5-flash',
+            'gemini-2.0-flash',
+            'gemini-2.0-flash-lite',
+        ]
+        # Start with the currently selected model, followed by others
+        seen = set()
+        models_to_try = []
+        for m in [self.gemini_model_name] + all_models:
+            if m not in seen:
+                seen.add(m)
+                models_to_try.append(m)
+
+        for model_name in models_to_try:
+            try:
+                response = self.gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=temperature,
+                        top_p=0.9,
+                        max_output_tokens=max_output_tokens,
+                    )
+                )
+                text = response.text if response and response.text else None
+                if text and text.strip():
+                    if model_name != self.gemini_model_name:
+                        print(f"[Gemini] Succeeded with fallback model '{model_name}' ({len(text)} chars)")
+                        self.gemini_model_name = model_name  # promote for future calls
+                    else:
+                        print(f"[Gemini] Successfully generated response ({len(text)} chars)")
+                    return text.strip()
+                else:
+                    print(f"[Gemini] '{model_name}' returned no text, trying next...")
+                    continue
+
+            except google_exceptions.ResourceExhausted as e:
+                # 429 per-model quota — try the next model, it may have separate quota
+                print(f"[Gemini] '{model_name}' quota exhausted (429), trying next model...")
+                self.last_ai_error = {
+                    "type": "rate_limit",
+                    "message": "Gemini quota exceeded. Trying another model..."
                 }
-            )
-            # Try different ways to extract text from Gemini response
-            text = None
-            if hasattr(response, 'text'):
-                text = response.text
-            elif hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
-                    text = ''.join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
-            
-            if text and text.strip():
-                print(f"[Gemini] Successfully generated response ({len(text)} chars)")
-                return text.strip()
-            else:
-                print("[Gemini] Response received but no text found")
+                continue
+
+            except google_exceptions.ServiceUnavailable as e:
+                print(f"[Gemini] '{model_name}' unavailable (503), trying next model...")
+                self.last_ai_error = {
+                    "type": "service_unavailable",
+                    "message": "Gemini is temporarily under high demand."
+                }
+                continue
+
+            except Exception as e:
+                err_str = str(e)
+                if any(kw in err_str.lower() for kw in ['503', 'overloaded', 'unavailable', 'high demand']):
+                    print(f"[Gemini] '{model_name}' overloaded, trying next model...")
+                    self.last_ai_error = {
+                        "type": "service_unavailable",
+                        "message": "Gemini is temporarily under high demand."
+                    }
+                    continue
+                if '429' in err_str or 'resource_exhausted' in err_str.lower() or 'quota' in err_str.lower():
+                    print(f"[Gemini] '{model_name}' quota exhausted, trying next model...")
+                    self.last_ai_error = {
+                        "type": "rate_limit",
+                        "message": "Gemini quota exceeded. Trying another model..."
+                    }
+                    continue
+                if '404' in err_str or 'not_found' in err_str.lower() or 'not found' in err_str.lower() or 'not supported' in err_str.lower():
+                    print(f"[Gemini] '{model_name}' not available in this API version, trying next model...")
+                    self.last_ai_error = {
+                        "type": "model_not_found",
+                        "message": f"Model {model_name} not available."
+                    }
+                    continue
+                self.last_ai_error = {
+                    "type": "api_error",
+                    "message": err_str
+                }
+                print(f"[Gemini] Error calling '{model_name}': {e}")
                 return None
-        except Exception as e:
-            print(f"[Gemini] Error calling API: {e}")
-            import traceback
-            traceback.print_exc()
+
+        print("[Gemini] All models in cascade exhausted — falling back to local model.")
+        self.last_ai_error = {
+            "type": "rate_limit",
+            "message": "All Gemini models are currently quota-limited or unavailable."
+        }
         return None
+
+    def _ai_error_message(self):
+        if not self.last_ai_error:
+            return "AI service is temporarily unavailable. Please try again."
+
+        if self.last_ai_error.get("type") == "rate_limit":
+            return (
+                "Gemini is working, but the free API quota was reached just now. "
+                "Please wait around 15-60 seconds and try again. If your whole team is using the same API key, "
+                "this can happen quickly because the free tier has a low per-minute request limit."
+            )
+
+        if self.last_ai_error.get("type") == "service_unavailable":
+            return (
+                "Gemini is temporarily experiencing high demand right now. "
+                "Please wait a minute and try again. Your API key is valid; this is a temporary model availability issue."
+            )
+
+        return "Gemini could not answer right now. Please try again in a moment."
 
     def _summary_from_response(self, response_text):
         data = self._parse_json_response(response_text)
@@ -541,67 +840,70 @@ class AIModels:
                     return None
         return None
 
-    def _local_summarize(self, text, max_length, min_length):
+    def _local_summarize(self, text, max_length=150, min_length=50):
+        """Summarize text. Uses local transformer if available, else extractive summarization."""
         if not self.summarizer:
-            print("ℹ️ Summarizer pipeline unavailable, using lightweight fallback.")
-            return self._simple_summarize(text)
+            # No transformer loaded — use extractive summarization (TF-based sentence scoring)
+            return self._extractive_summarize(text, max_length)
 
+        # Calculate better max_length based on input text length (aim for 30-40% compression)
+        text_length = len(text.split())
+        text_char_length = len(text)
+        
+        if text_length > 50:
+            # For longer texts, use more aggressive summarization (30-40% of original)
+            # Use character-based calculation for better accuracy
+            calculated_max = max(min_length, min(max_length, int(text_char_length * 0.35)))
+            calculated_min = max(min_length, int(calculated_max * 0.6))
+        else:
+            # For shorter texts, still aim for compression
+            calculated_max = max(min_length, min(max_length, int(text_char_length * 0.5)))
+            calculated_min = max(min_length, int(calculated_max * 0.7))
+        
         max_input_length = 1024
         if len(text) > max_input_length:
             chunks = self._split_text(text, max_input_length)
             summaries = []
             for chunk in chunks:
                 if len(chunk.strip()) > 20:
-                    result = self.summarizer(
-                        chunk,
-                        max_length=max_length,
-                        min_length=min_length,
-                        do_sample=False,
-                        num_beams=4,
-                        early_stopping=True
-                    )
-                    summaries.append(result[0]['summary_text'])
-            return " ".join(summaries) or text[:max_length]
+                    try:
+                        result = self.summarizer(
+                            chunk,
+                            max_length=calculated_max,
+                            min_length=calculated_min,
+                            do_sample=False,
+                            num_beams=6,  # Increased for better quality
+                            early_stopping=True,
+                            no_repeat_ngram_size=3,  # Prevent repetition
+                            length_penalty=1.2  # Encourage shorter summaries
+                        )
+                        summaries.append(result[0]['summary_text'])
+                    except Exception as e:
+                        print(f"Error summarizing chunk: {e}")
+                        # Fallback: take first sentences
+                        sentences = self._split_into_sentences(chunk)
+                        summaries.append(" ".join(sentences[:2]) if sentences else chunk[:calculated_max])
+            return " ".join(summaries) or text[:calculated_max]
         else:
-            result = self.summarizer(
-                text,
-                max_length=max_length,
-                min_length=min_length,
-                do_sample=False,
-                num_beams=4,
-                early_stopping=True
-            )
-            return result[0]['summary_text']
-
-    def _simple_summarize(self, text, max_sentences=5):
-        """Lightweight frequency-based summarization when transformers are unavailable."""
-        sentences = self._split_into_sentences(text)
-        if not sentences:
-            return text[:200]
-
-        if len(sentences) <= max_sentences:
-            return " ".join(sentences)
-
-        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
-        stop_words = {
-            'the', 'and', 'for', 'with', 'that', 'this', 'from', 'have', 'will',
-            'your', 'about', 'which', 'their', 'would', 'there', 'into', 'while',
-            'where', 'when', 'been', 'them', 'they', 'these', 'those', 'also',
-            'such', 'than', 'then'
-        }
-        freq = Counter(word for word in words if word not in stop_words)
-        if not freq:
-            return " ".join(sentences[:max_sentences])
-
-        sentence_scores = []
-        for sentence in sentences:
-            sentence_words = re.findall(r'\b[a-zA-Z]{3,}\b', sentence.lower())
-            score = sum(freq.get(word, 0) for word in sentence_words)
-            sentence_scores.append((score, sentence))
-
-        top_sentences = sorted(sentence_scores, key=lambda x: x[0], reverse=True)[:max_sentences]
-        top_sentences = sorted(top_sentences, key=lambda x: sentences.index(x[1]))
-        return " ".join(sentence for _, sentence in top_sentences)
+            try:
+                result = self.summarizer(
+                    text,
+                    max_length=calculated_max,
+                    min_length=calculated_min,
+                    do_sample=False,
+                    num_beams=6,  # Increased for better quality
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,  # Prevent repetition
+                    length_penalty=1.2  # Encourage shorter summaries
+                )
+                return result[0]['summary_text']
+            except Exception as e:
+                print(f"Error in local summarization: {e}")
+                # Fallback: extract key sentences
+                sentences = self._split_into_sentences(text)
+                if len(sentences) > 3:
+                    return " ".join(sentences[:3])
+                return text[:calculated_max]
 
     def _fallback_study_plan(self, syllabus_text, days_available):
         topics = self._extract_topics(syllabus_text)
@@ -657,30 +959,85 @@ class AIModels:
             return "Unable to generate summary at the moment."
 
         clean = re.sub(r'\s+', ' ', summary_text).strip()
+        original_len = len(original_text) if original_text else len(clean)
 
-        if original_text and len(clean) > len(original_text) * 0.9:
+        # STRICT CHECK: If summary is more than 60% of original, it's not a real summary
+        if original_text and len(clean) > original_len * 0.6:
+            print(f"[WARNING] Summary too long: {len(clean)} chars vs {original_len} original ({len(clean)/original_len*100:.1f}%)")
+            # Try to refine with T5
             refined = self._refine_with_t5(original_text)
-            if refined:
+            if refined and len(refined) < len(clean) and len(refined) < original_len * 0.6:
                 clean = refined.strip()
+            else:
+                # Last resort: extract only first 2-3 sentences and condense
+                sentences = self._split_into_sentences(original_text)
+                if sentences:
+                    # Take first sentence and try to make it more concise
+                    first_sent = sentences[0]
+                    if len(first_sent) > 100:
+                        # Try to summarize just the first sentence
+                        try:
+                            if hasattr(self, 'summarizer'):
+                                result = self.summarizer(
+                                    first_sent,
+                                    max_length=min(80, len(first_sent) // 2),
+                                    min_length=30,
+                                    do_sample=False,
+                                    num_beams=4
+                                )
+                                clean = result[0]['summary_text']
+                            else:
+                                clean = first_sent[:100] + "..."
+                        except:
+                            clean = first_sent[:100] + "..."
+                    else:
+                        clean = first_sent
+                    # Add one more key sentence if available
+                    if len(sentences) > 1 and len(clean) < original_len * 0.5:
+                        clean += " " + sentences[1][:80]
+
+        # Check if summary already contains key points format
+        if "Key Points:" in clean or "key_points" in clean.lower():
+            # Still check length
+            if original_text and len(clean) > original_len * 0.7:
+                # Extract just the summary part before "Key Points"
+                parts = re.split(r'Key Points?:', clean, flags=re.IGNORECASE)
+                if parts and len(parts[0]) < original_len * 0.5:
+                    return clean
+                # If still too long, return just first part
+                return parts[0].strip() if parts else clean
+            return clean
 
         sentences = self._split_into_sentences(clean)
         if not sentences:
             return clean
 
-        main_summary = " ".join(sentences[:min(2, len(sentences))])
+        # Limit to 2-3 sentences max for main summary
+        max_sentences = 3 if original_len > 200 else 2
+        main_summary = " ".join(sentences[:min(max_sentences, len(sentences))])
+        
+        # Ensure main summary is actually shorter
+        if len(main_summary) > original_len * 0.6:
+            # Take only first sentence
+            main_summary = sentences[0] if sentences else clean
 
+        # Extract key points from remaining sentences (but limit total length)
         bullets = []
         seen = set()
-        for sentence in sentences:
+        remaining_length = original_len * 0.4  # Max 40% for bullets
+        
+        for sentence in sentences[max_sentences:]:
             s = sentence.strip(" -•")
-            if len(s) < 5:
+            if len(s) < 10:
                 continue
+            if len(" ".join(bullets)) + len(s) > remaining_length:
+                break
             normalized = s.lower()
             if normalized in seen:
                 continue
             seen.add(normalized)
             bullets.append(s)
-            if len(bullets) == 5:
+            if len(bullets) >= 4:  # Limit to 4 bullets
                 break
 
         if bullets:
@@ -859,6 +1216,67 @@ class AIModels:
 
         return chunks
 
+    def _extractive_summarize(self, text, max_chars=300):
+        """Extractive summarization using word-frequency sentence scoring.
+        Picks the most informationally dense sentences from throughout the text.
+        This is a pure-Python fallback requiring no ML models.
+        """
+        stop_words = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to',
+            'for', 'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were',
+            'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+            'will', 'would', 'could', 'should', 'may', 'might', 'it', 'its',
+            'this', 'that', 'these', 'those', 'i', 'we', 'you', 'they', 'he',
+            'she', 'as', 'also', 'so', 'if', 'not', 'no', 'can', 'into',
+        }
+
+        # Split text into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+
+        if not sentences:
+            return text[:max_chars]
+        if len(sentences) <= 2:
+            result = ' '.join(sentences)
+            return result[:max_chars] + ('...' if len(result) > max_chars else '')
+
+        # Count word frequencies (excluding stop words)
+        all_words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+        freq = Counter(w for w in all_words if w not in stop_words)
+
+        # Score each sentence by the sum of its word frequencies
+        def score_sentence(sent):
+            words = re.findall(r'\b[a-zA-Z]{3,}\b', sent.lower())
+            content_words = [w for w in words if w not in stop_words]
+            if not content_words:
+                return 0
+            return sum(freq.get(w, 0) for w in content_words) / len(content_words)
+
+        scored = [(i, s, score_sentence(s)) for i, s in enumerate(sentences)]
+
+        # Target: pick enough sentences to cover ~35% of original, max ~3-4 sentences
+        target_chars = min(max_chars, int(len(text) * 0.35))
+        
+        # Sort by score descending, then pick top sentences up to target length
+        sorted_by_score = sorted(scored, key=lambda x: x[2], reverse=True)
+        
+        selected_indices = set()
+        total_chars = 0
+        for i, s, score in sorted_by_score:
+            if total_chars + len(s) > target_chars and len(selected_indices) >= 2:
+                break
+            selected_indices.add(i)
+            total_chars += len(s)
+            if len(selected_indices) >= 4:  # Max 4 sentences
+                break
+
+        # Re-order selected sentences by their original position
+        selected = [s for i, s, _ in scored if i in selected_indices]
+
+        summary = ' '.join(selected)
+        print(f"[Extractive] Summarized from {len(text)} to {len(summary)} chars using sentence scoring")
+        return summary
+
     def _normalize_concept(self, text):
         cleaned = text.strip()
         cleaned = re.sub(
@@ -979,49 +1397,30 @@ class AIModels:
         return f"{base}\n\nKey Points:\n{bullets}"
 
     def _sanitize_explanation_text(self, text):
+        """Light sanitization — only remove prompt echoes and severe word repetition.
+        Never strip real content words like 'definition', 'explain', etc."""
         if not text:
             return ""
-        
-        # Remove excessive whitespace
-        cleaned = re.sub(r'\s+', ' ', text)
-        
-        # Remove repeated words (e.g., "cyber cyber cyber security" -> "cyber security")
-        # This pattern catches 2+ consecutive repetitions of the same word
+
+        cleaned = text
+
+        # Remove prompt echo patterns only (full repeated instructions, not content words)
+        cleaned = re.sub(
+            r'(Explain\s+the\s+concept\s+of\s+[^.]+\.?\s*){2,}',
+            '', cleaned, flags=re.IGNORECASE
+        )
+        cleaned = re.sub(
+            r'(Describe\s+the\s+concept\s+of\s+[^.]+\.?\s*){2,}',
+            '', cleaned, flags=re.IGNORECASE
+        )
+
+        # Collapse excessive whitespace
+        cleaned = re.sub(r' {2,}', ' ', cleaned)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+        # Remove same consecutive word repeated 3+ times (e.g. "the the the")
         cleaned = re.sub(r'\b(\w+)(\s+\1\b){2,}', r'\1', cleaned, flags=re.IGNORECASE)
-        
-        # Remove repeated phrases (e.g., "Explain the concept of X" repeated)
-        cleaned = re.sub(r'(Explain\s+the\s+concept\s+of\s+[^.]+\.?\s*){2,}', '', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'(Describe\s+the\s+concept\s+of\s+[^.]+\.?\s*){2,}', '', cleaned, flags=re.IGNORECASE)
-        
-        # Remove instruction phrases that shouldn't be in the output
-        cleaned = re.sub(r'\b(?:explain|describe|define|definition)\s+(?:the\s+)?(?:concept\s+of\s+)?[: ]*', '', cleaned, flags=re.IGNORECASE)
-        
-        # Remove trailing repetition patterns (e.g., "cyber cyber cyber security" at the end)
-        # Split by sentences and check each one
-        sentences = re.split(r'[.!?]+', cleaned)
-        cleaned_sentences = []
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            
-            # Check for excessive repetition in this sentence
-            words = sentence.split()
-            if len(words) > 2:
-                # Count unique words vs total words
-                unique_words = len(set(w.lower() for w in words))
-                if unique_words < len(words) * 0.4:  # More than 60% repetition
-                    continue  # Skip this sentence
-            
-            # Remove any remaining word repetitions within the sentence
-            sentence = re.sub(r'\b(\w+)(\s+\1\b)+', r'\1', sentence, flags=re.IGNORECASE)
-            if sentence and len(sentence.strip()) > 10:
-                cleaned_sentences.append(sentence)
-        
-        cleaned = '. '.join(cleaned_sentences)
-        if cleaned and not cleaned.endswith('.'):
-            cleaned += '.'
-        
+
         return cleaned.strip()
 
     def _trim_sentence(self, sentence):

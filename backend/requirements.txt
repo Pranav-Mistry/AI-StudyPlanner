@@ -1,7 +1,7 @@
 flask==3.0.0
 flask-cors==4.0.0
 python-dotenv==1.0.0
-transformers>=4.40.0
+transformers>=4.40.0,<5.0.0
 torch==2.6.0
 firebase-admin==6.3.0
 PyPDF2==3.0.1

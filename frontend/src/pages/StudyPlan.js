@@ -1,7 +1,14 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Card from '../components/Card';
-import { generateStudyPlan, uploadSyllabus } from '../api/services';
+import {
+  deleteStudyPlan,
+  generateStudyPlan,
+  loadStudyPlan,
+  saveStudyPlan as saveStudyPlanRequest,
+  updateStudyPlanDayStatus,
+  uploadSyllabus
+} from '../api/services';
 import toast from 'react-hot-toast';
 import { Upload, Calendar, BookOpen, Clock, Loader2, ArrowLeft } from 'lucide-react';
 
@@ -72,15 +79,7 @@ const StudyPlan = ({ user }) => {
       }
 
       try {
-        // Load study plan
-        const planResponse = await fetch(`http://localhost:5000/api/study-plan/load?user_id=${user.uid}`, {
-          headers: {
-            'Authorization': `Bearer ${await user.getIdToken()}`,
-            'Content-Type': 'application/json'
-          }
-        });
-        
-        const planData = await planResponse.json();
+        const planData = await loadStudyPlan(user.uid);
         if (planData.success && planData.study_plan) {
           setStudyPlan(planData.study_plan);
           setPlanId(planData.plan_id || user.uid);
@@ -125,20 +124,10 @@ const StudyPlan = ({ user }) => {
 
     setSaving(true);
     try {
-      const token = await user.getIdToken();
-      const response = await fetch('http://localhost:5000/api/study-plan/save', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          user_id: user.uid,
-          study_plan: plan
-        })
+      const data = await saveStudyPlanRequest({
+        user_id: user.uid,
+        study_plan: plan
       });
-
-      const data = await response.json();
       if (data.success) {
         if (data.plan_id) {
           setPlanId(data.plan_id);
@@ -226,19 +215,7 @@ const StudyPlan = ({ user }) => {
 
     setDeleting(true);
     try {
-      const token = await user.getIdToken();
-      const response = await fetch('http://localhost:5000/api/study-plan/delete', {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          user_id: user.uid,
-        }),
-      });
-
-      const data = await response.json();
+      const data = await deleteStudyPlan(user.uid);
       if (!data.success) {
         throw new Error(data.error || 'Failed to delete study plan');
       }
@@ -269,24 +246,11 @@ const StudyPlan = ({ user }) => {
     const isCompleted = completedDays.includes(dayNumber);
 
     try {
-      const headers = {
-        'Content-Type': 'application/json',
-      };
-      if (user) {
-        headers.Authorization = `Bearer ${await user.getIdToken()}`;
-      }
-
-      const response = await fetch('http://localhost:5000/api/study-plan/day-status', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          user_id: user.uid,
-          day: dayNumber,
-          completed: !isCompleted,
-        }),
+      const data = await updateStudyPlanDayStatus({
+        user_id: user.uid,
+        day: dayNumber,
+        completed: !isCompleted,
       });
-
-      const data = await response.json();
       if (!data.success) {
         throw new Error(data.error || 'Failed to update topic');
       }

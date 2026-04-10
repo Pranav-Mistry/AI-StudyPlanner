@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { Toaster } from 'react-hot-toast';
 import { auth } from './firebase/config';
 import { onAuthStateChanged } from 'firebase/auth';
+import { recordUserActivity } from './api/services';
 
 // Pages
 import Login from './pages/Login';
@@ -14,6 +15,8 @@ import AIAssistant from './pages/AIAssistant';
 import Progress from './pages/Progress';
 import Leaderboard from './pages/Leaderboard';
 import QuizGenerator from './pages/QuizGenerator';
+import Flashcards from './pages/Flashcards';
+import ExamCountdown from './pages/ExamCountdown';
 
 // Components
 import Navbar from './components/Navbar';
@@ -27,6 +30,12 @@ function App() {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
       setLoading(false);
+
+      if (currentUser) {
+        recordUserActivity(currentUser).catch((error) => {
+          console.error('Failed to record user activity:', error);
+        });
+      }
     });
 
     return () => unsubscribe();
@@ -76,9 +85,17 @@ function App() {
             path="/leaderboard" 
             element={user ? <Leaderboard user={user} /> : <Navigate to="/login" />} 
           />
-          <Route 
-            path="/quiz" 
-            element={user ? <QuizGenerator user={user} /> : <Navigate to="/login" />} 
+          <Route
+            path="/quiz"
+            element={user ? <QuizGenerator user={user} /> : <Navigate to="/login" />}
+          />
+          <Route
+            path="/flashcards"
+            element={user ? <Flashcards user={user} /> : <Navigate to="/login" />}
+          />
+          <Route
+            path="/exams"
+            element={user ? <ExamCountdown user={user} /> : <Navigate to="/login" />}
           />
           <Route 
             path="/" 

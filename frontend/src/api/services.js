@@ -62,6 +62,15 @@ export const answerQuestion = async ({ question, context }) => {
   }
 };
 
+export const recordUserActivity = async (user) => {
+  const response = await axios.post('/api/auth/activity', {
+    user_id: user.uid,
+    name: user.displayName || user.email || 'Learner',
+    email: user.email || '',
+  });
+  return response.data;
+};
+
 // Progress Services
 export const updateProgress = async (data) => {
   const response = await axios.post('/api/progress/update', data);
@@ -70,6 +79,30 @@ export const updateProgress = async (data) => {
 
 export const getProgress = async (userId) => {
   const response = await axios.get(`/api/progress/${userId}`);
+  return response.data;
+};
+
+export const saveStudyPlan = async (data) => {
+  const response = await axios.post('/api/study-plan/save', data);
+  return response.data;
+};
+
+export const loadStudyPlan = async (userId) => {
+  const response = await axios.get('/api/study-plan/load', {
+    params: { user_id: userId },
+  });
+  return response.data;
+};
+
+export const deleteStudyPlan = async (userId) => {
+  const response = await axios.delete('/api/study-plan/delete', {
+    data: { user_id: userId },
+  });
+  return response.data;
+};
+
+export const updateStudyPlanDayStatus = async (data) => {
+  const response = await axios.post('/api/study-plan/day-status', data);
   return response.data;
 };
 

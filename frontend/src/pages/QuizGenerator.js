@@ -129,7 +129,7 @@ const QuizGenerator = ({ user }) => {
 
         <div className="mb-8 animate-fade-in">
           <h1 className="text-4xl font-bold text-white mb-2">🧠 AI Quiz Generator</h1>
-          <p className="text-indigo-100 text-lg">
+          <p className="text-white/80 text-lg">
             Generate instant quizzes from your study materials and climb the leaderboard!
           </p>
         </div>
@@ -160,7 +160,7 @@ const QuizGenerator = ({ user }) => {
                     <p className="text-gray-600">
                       {file ? file.name : 'Click to upload PDF or drag and drop'}
                     </p>
-                    <p className="text-sm text-gray-500 mt-1">PDF up to 10MB</p>
+                    <p className="text-sm text-white/80 mt-1">PDF up to 10MB</p>
                   </label>
                 </div>
               </div>

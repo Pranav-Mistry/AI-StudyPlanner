@@ -7,7 +7,7 @@ from firebase_admin import credentials, firestore, auth
 from ai_models import AIModels
 from pdf_processor import PDFProcessor
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 load_dotenv()
 
@@ -17,7 +17,8 @@ CORS(app)
 
 # Initialize Firebase
 try:
-    cred = credentials.Certificate('firebase-credentials.json')
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cred = credentials.Certificate(os.path.join(base_dir, 'firebase-credentials.json'))
     firebase_admin.initialize_app(cred)
     db = firestore.client()
     print("[OK] Firebase initialized successfully")
@@ -66,7 +67,7 @@ def update_user_profile(user_id, name='', email='', points_delta=0, record_activ
         except Exception:
             return None
 
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     last_active_date = to_date(last_active)
 
     if record_activity:
@@ -136,7 +137,7 @@ def recalculate_user_points(user_id):
 
     quiz_points = 0
     try:
-        quiz_results = db.collection('quiz_results').where('user_id', '==', user_id).stream()
+        quiz_results = db.collection('quiz_results').where(filter=firestore.FieldFilter('user_id', '==', user_id)).stream()
         for result in quiz_results:
             result_data = result.to_dict() or {}
             if result_data:
@@ -212,6 +213,40 @@ def register():
             'success': False,
             'error': str(e)
         }), 400
+
+@app.route('/api/auth/activity', methods=['POST'])
+def record_activity():
+    try:
+        data = request.get_json(silent=True) or {}
+        user_id = data.get('user_id')
+        name = data.get('name', '')
+        email = data.get('email', '')
+
+        if not user_id:
+            return jsonify({'success': False, 'error': 'User ID is required'}), 400
+
+        if not db:
+            return jsonify({'success': False, 'error': 'Database not available'}), 500
+
+        engagement = update_user_profile(
+            user_id,
+            name=name,
+            email=email,
+            record_activity=True
+        )
+        total_points = recalculate_user_points(user_id)
+
+        return jsonify({
+            'success': True,
+            'streak': engagement.get('streak', 0),
+            'daily_bonus': engagement.get('daily_bonus', 0),
+            'last_active_date': engagement.get('last_active_date'),
+            'total_points': total_points
+        })
+
+    except Exception as e:
+        print(f"Error recording activity: {traceback.format_exc()}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/syllabus/upload', methods=['POST'])
 def upload_syllabus():
@@ -394,11 +429,33 @@ def generate_study_plan():
 @app.route('/api/notes/summarize', methods=['POST'])
 def summarize_notes():
     try:
-        data = request.json
-        text = data.get('text')
+        text = None
         
+        # Check if file is uploaded
+        if 'file' in request.files:
+            file = request.files['file']
+            if file and file.filename:
+                if file.filename.lower().endswith('.pdf'):
+                    # Extract text from PDF
+                    text = pdf_processor.extract_text_from_pdf(file)
+                    if not text or len(text.strip()) < 50:
+                        return jsonify({
+                            'success': False,
+                            'error': 'Could not extract sufficient text from PDF. Please ensure the PDF contains readable text.'
+                        }), 400
+                else:
+                    return jsonify({
+                        'success': False,
+                        'error': 'Only PDF files are supported'
+                    }), 400
+        
+        # If no file, check for text in JSON body
         if not text:
-            return jsonify({'success': False, 'error': 'No text provided'}), 400
+            data = request.get_json() or {}
+            text = data.get('text')
+        
+        if not text or not text.strip():
+            return jsonify({'success': False, 'error': 'No text provided. Please upload a PDF or paste text.'}), 400
         
         # Summarize using AI
         summary = ai_models.summarize_text(text)
@@ -571,10 +628,62 @@ def get_progress(user_id):
                 plan_dict['id'] = plan_doc.id
                 plans_data.append(plan_dict)
         
+        # Get quiz results for progress tracking
+        quiz_results_data = []
+        quiz_stats = {
+            'total_quizzes': 0,
+            'total_questions': 0,
+            'total_correct': 0,
+            'average_score': 0
+        }
+        try:
+            # Get ALL quiz results for stats calculation
+            all_quiz_results = db.collection('quiz_results').where(filter=firestore.FieldFilter('user_id', '==', user_id)).stream()
+            
+            all_results = []
+            for result in all_quiz_results:
+                result_data = result.to_dict() or {}
+                if result_data:
+                    # Handle Firestore timestamp
+                    created_at = result_data.get('created_at')
+                    timestamp_value = 0
+                    if created_at:
+                        # If it's a Firestore timestamp, convert to seconds
+                        if hasattr(created_at, 'timestamp'):
+                            timestamp_value = created_at.timestamp()
+                        elif isinstance(created_at, (int, float)):
+                            timestamp_value = created_at
+                    
+                    all_results.append({
+                        'score': result_data.get('score', 0),
+                        'total_questions': result_data.get('total_questions', 0),
+                        'created_at': created_at,
+                        'created_at_timestamp': timestamp_value,
+                        'points_earned': result_data.get('points_earned', 0)
+                    })
+            
+            # Calculate stats from ALL results
+            if all_results:
+                for result_data in all_results:
+                    quiz_stats['total_quizzes'] += 1
+                    quiz_stats['total_questions'] += result_data.get('total_questions', 0)
+                    quiz_stats['total_correct'] += result_data.get('score', 0)
+                
+                # Sort by created_at timestamp, take most recent 10 for display
+                all_results.sort(key=lambda x: x.get('created_at_timestamp', 0), reverse=True)
+                quiz_results_data = all_results[:10]
+                
+                if quiz_stats['total_quizzes'] > 0:
+                    quiz_stats['average_score'] = round((quiz_stats['total_correct'] / quiz_stats['total_questions']) * 100, 1) if quiz_stats['total_questions'] > 0 else 0
+        except Exception as e:
+            print(f"Error fetching quiz results: {e}")
+        
         return jsonify({
             'success': True,
             'user': user_data,
-            'plans': plans_data
+            'plans': plans_data,
+            'quiz_results': quiz_results_data,
+            'quiz_stats': quiz_stats
         })
         
     except Exception as e:
@@ -764,6 +873,167 @@ def update_day_status():
 
     except Exception as e:
         print(f"Error updating day status: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ── Flashcard Generator ───────────────────────────────────────────────────────
+@app.route('/api/flashcards/generate', methods=['POST'])
+def generate_flashcards():
+    """Generate flashcards (Q&A pairs) from text or PDF using AI."""
+    try:
+        text = None
+        num_cards = 8
+
+        # Check if PDF file is uploaded
+        if 'file' in request.files:
+            file = request.files['file']
+            if file and file.filename:
+                if file.filename.lower().endswith('.pdf'):
+                    text = pdf_processor.extract_text_from_pdf(file)
+                    if not text or len(text.strip()) < 50:
+                        return jsonify({'success': False, 'error': 'Could not extract sufficient text from PDF. Ensure the PDF contains readable text.'}), 400
+                else:
+                    return jsonify({'success': False, 'error': 'Only PDF files are supported.'}), 400
+            num_cards = min(int(request.form.get('num_cards', 8)), 15)
+        else:
+            # JSON body
+            data = request.get_json() or {}
+            text = (data.get('text') or '').strip()
+            num_cards = min(int(data.get('num_cards', 8)), 15)
+
+        if not text or len(text.strip()) < 30:
+            return jsonify({'success': False, 'error': 'Please provide at least 30 characters of content.'}), 400
+
+        flashcards = ai_models.generate_flashcards(text, num_cards)
+        return jsonify({'success': True, 'flashcards': flashcards})
+
+    except Exception as e:
+        print(f"Error generating flashcards: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ── History & Exams ────────────────────────────────────────────────────────
+
+@app.route('/api/history/<user_id>', methods=['GET'])
+def get_user_history(user_id):
+    try:
+        feature = request.args.get('feature')
+        if not db:
+            return jsonify({'success': False, 'error': 'Database not available'}), 500
+        
+        query = db.collection('user_history').where(filter=firestore.FieldFilter('user_id', '==', user_id))
+        if feature:
+            query = query.where(filter=firestore.FieldFilter('feature', '==', feature))
+            
+        results = query.stream()
+        
+        history = []
+        for doc in results:
+            data = doc.to_dict()
+            data['id'] = doc.id
+            history.append(data)
+            
+        # Sort in memory descending by createdAt to avoid Firestore composite index requirement
+        history.sort(key=lambda x: x.get('createdAt', ''), reverse=True)
+        # Limit to 25
+        history = history[:25]
+            
+        return jsonify({'success': True, 'history': history})
+    except Exception as e:
+        print(f"Error fetching history: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/history/save', methods=['POST'])
+def save_user_history():
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        feature = data.get('feature')
+        
+        if not user_id or not feature:
+            return jsonify({'success': False, 'error': 'Missing required fields'}), 400
+        if not db:
+            return jsonify({'success': False, 'error': 'Database not available'}), 500
+
+        payload = {
+            'user_id': user_id,
+            'feature': feature,
+            'title': data.get('title', '')[:80],
+            'data': data.get('data', {}),
+            'createdAt': datetime.now(timezone.utc).isoformat()
+        }
+        
+        if data.get('id'):
+            # Update existing
+            doc_ref = db.collection('user_history').document(data['id'])
+            doc_ref.set({'data': data.get('data', {}), 'updatedAt': datetime.now(timezone.utc).isoformat()}, merge=True)
+            payload['id'] = data.get('id')
+        else:
+            doc_ref = db.collection('user_history').document()
+            doc_ref.set(payload)
+            payload['id'] = doc_ref.id
+            
+        return jsonify({'success': True, 'item': payload})
+    except Exception as e:
+        print(f"Error saving history: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/history/delete', methods=['DELETE'])
+def delete_user_history():
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        doc_id = data.get('id')
+        clear_feature = data.get('clear_feature')
+        
+        if not db:
+            return jsonify({'success': False, 'error': 'Database not available'}), 500
+        
+        if clear_feature and user_id:
+            # Clear all for a feature
+            docs = db.collection('user_history').where(filter=firestore.FieldFilter('user_id', '==', user_id)).where(filter=firestore.FieldFilter('feature', '==', clear_feature)).stream()
+            for doc in docs:
+                doc.reference.delete()
+        elif doc_id:
+            db.collection('user_history').document(doc_id).delete()
+            
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"Error deleting history: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/exams/<user_id>', methods=['GET'])
+def get_user_exams(user_id):
+    try:
+        if not db:
+            return jsonify({'success': False, 'error': 'Database not available'}), 500
+            
+        doc = db.collection('user_exams').document(user_id).get()
+        exams = doc.to_dict().get('exams', []) if doc.exists else []
+        return jsonify({'success': True, 'exams': exams})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/exams/save', methods=['POST'])
+def save_user_exams():
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        exams = data.get('exams', [])
+        
+        if not user_id:
+            return jsonify({'success': False, 'error': 'Missing user_id'}), 400
+        if not db:
+            return jsonify({'success': False, 'error': 'Database not available'}), 500
+            
+        db.collection('user_exams').document(user_id).set({
+            'user_id': user_id,
+            'exams': exams,
+            'updatedAt': firestore.SERVER_TIMESTAMP
+        }, merge=True)
+        return jsonify({'success': True})
+    except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':

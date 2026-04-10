@@ -75,7 +75,7 @@ const Leaderboard = ({ user }) => {
         <div className="mb-8 animate-fade-in text-center">
           <Trophy className="w-16 h-16 text-yellow-400 mx-auto mb-4" />
           <h1 className="text-4xl font-bold text-white mb-2">🏆 Leaderboard</h1>
-          <p className="text-indigo-100 text-lg">
+          <p className="text-white/80 text-lg">
             Top performers this month
           </p>
         </div>
@@ -196,7 +196,7 @@ const Leaderboard = ({ user }) => {
               • Keep your daily streak alive: <strong>+5 points</strong> every day you stay consistent.
             </li>
             <li>
-              • Finish AI-generated quizzes with confidence: <strong>score × 5 points</strong> per quiz submission.
+              • Finish AI-generated quizzes with confidence: <strong>score × 1 point</strong> per quiz submission.
             </li>
           </ul>
         </Card>
